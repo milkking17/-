@@ -51,9 +51,11 @@ CAMERA_ID = 0  # 电脑内置摄像头默认ID=0
 CAMERA_WIDTH = 640  # 摄像头分辨率（降低分辨率提升速度）
 CAMERA_HEIGHT = 480
 SEND_INTERVAL = 0.1  # 发送间隔（秒）
-DRAW_THRESHOLD = 0.5  # 检测置信度阈值
+DRAW_THRESHOLD = 0.3  # 降低阈值，更容易检测到目标
 SAVE_CROP_IMG = False  # 实时场景默认不保存裁剪图，提升速度
 TEMP_IMG_PATH = "temp_frame.jpg"  # 临时保存摄像头帧的文件
+# 全局OCR实例（只初始化一次，提升速度）
+OCR_INSTANCE = None
 # ===========================================================================
 
 def parse_args():
@@ -149,8 +151,18 @@ def crop_image_by_bbox(img, bbox, save_path=None):
 def process_detection_result(img, result, FLAGS, label_list):
     """
     处理单帧检测结果，返回结构化的识别信息（仅包含有效结果）
-    关键修复：所有numpy类型转Python原生类型，支持JSON序列化
+    关键修复：1. 移除OCR的show_log参数 2. 全局OCR实例避免重复初始化 3. 异常处理防止崩溃
     """
+    global OCR_INSTANCE
+    # 初始化全局OCR实例（只初始化一次，提升速度+避免重复报错）
+    if FLAGS.enable_ocr and OCR_INSTANCE is None:
+        try:
+            # 关键修复：移除show_log=False，适配新版本PaddleOCR
+            OCR_INSTANCE = PaddleOCR(lang=FLAGS.ocr_lang, use_angle_cls=True)
+        except Exception as e:
+            logger.warning(f"OCR初始化失败：{e}，将关闭OCR功能")
+            FLAGS.enable_ocr = False
+
     valid_info = {
         "timestamp": float(time.time()),  # 转成Python float
         "road_signs": [],  # 路牌信息
@@ -197,10 +209,14 @@ def process_detection_result(img, result, FLAGS, label_list):
                 crop_img = crop_image_by_bbox(img, [x1, y1, x2, y2])
                 ocr_text = ""
                 if crop_img.size > 0:
-                    ocr = PaddleOCR(lang=FLAGS.ocr_lang, use_angle_cls=True, show_log=False)
-                    ocr_result = ocr.ocr(crop_img)
-                    if ocr_result and ocr_result[0]:
-                        ocr_text = ' '.join([line[1][0] for line in ocr_result[0]])
+                    try:
+                        # 异常处理：避免单帧OCR识别失败导致程序崩溃
+                        ocr_result = OCR_INSTANCE.ocr(crop_img)
+                        if ocr_result and ocr_result[0]:
+                            ocr_text = ' '.join([line[1][0] for line in ocr_result[0]])
+                    except Exception as e:
+                        logger.warning(f"单帧OCR识别失败：{e}")
+                        ocr_text = "识别失败"
                 
                 road_sign_info = {
                     "class_name": cls_name,
@@ -254,6 +270,8 @@ def run_realtime_detection(FLAGS, cfg):
     if os.path.exists(FLAGS.label_list_path):
         with open(FLAGS.label_list_path, 'r', encoding='utf-8') as f:
             label_list = [line.strip() for line in f.readlines() if line.strip()]
+    else:
+        logger.warning(f"标签文件不存在：{FLAGS.label_list_path}，将使用默认类别名")
 
     # 摄像头ID重试逻辑
     cap = None
@@ -280,6 +298,7 @@ def run_realtime_detection(FLAGS, cfg):
     logger.info("开始实时检测（按q键退出）...")
     logger.info(f"摄像头分辨率：{CAMERA_WIDTH}x{CAMERA_HEIGHT}")
     logger.info(f"发送间隔：{SEND_INTERVAL}秒")
+    logger.info(f"检测置信度阈值：{FLAGS.draw_threshold}")
 
     try:
         while True:
@@ -314,6 +333,28 @@ def run_realtime_detection(FLAGS, cfg):
 
             # 处理检测结果
             valid_info = process_detection_result(frame, detection_result, FLAGS, label_list)
+
+            # ========== 绘制检测框和标签 ==========
+            if valid_info is not None:
+                # 绘制红绿灯检测框（红色）
+                for light in valid_info["traffic_lights"]:
+                    bbox = light["bbox"]
+                    x1, y1, x2, y2 = int(bbox["x1"]), int(bbox["y1"]), int(bbox["x2"]), int(bbox["y2"])
+                    # 画框：红色框，线宽2
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    # 写标签：颜色+置信度
+                    label = f"{light['color']} {light['confidence']:.2f}"
+                    cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+                # 绘制路牌检测框（蓝色）
+                for sign in valid_info["road_signs"]:
+                    bbox = sign["bbox"]
+                    x1, y1, x2, y2 = int(bbox["x1"]), int(bbox["y1"]), int(bbox["x2"]), int(bbox["y2"])
+                    # 画框：蓝色框，线宽2
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    # 写标签：OCR文本+置信度
+                    label = f"{sign['ocr_text']} {sign['confidence']:.2f}"
+                    cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
             # 控制发送频率
             current_time = time.time()
